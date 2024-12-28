@@ -9,3 +9,4 @@ pyrightconfig.json
 .ipynb_checkpoints/
 mdproj.py
 ./pd_1d_rule_solver/__pycache__
+pd_1d_rule_solver/__pycache__/

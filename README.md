@@ -39,3 +39,4 @@ Check out `example.ipynb` for detailed usage examples.
 - Python ≥ 3.7
 - pandas ≥ 1.0.0
 - numpy ≥ 1.18.0
+- numba ≥ 0.60.0

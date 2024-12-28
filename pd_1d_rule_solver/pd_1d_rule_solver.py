@@ -3,13 +3,47 @@ import numpy as np
 from pandas.api.types import is_numeric_dtype
 from typing import List, Union, Dict, Tuple, Optional
 import warnings
+from numba import njit  # Import Numba's JIT decorator
+
+@njit
+def find_best_interval_kadane(outcomes: np.ndarray) -> Tuple[float, int, int]:
+    """
+    Find the interval with the maximum sum using Kadane's algorithm.
+
+    Args:
+        outcomes: 1D numpy array of numerical outcomes.
+
+    Returns:
+        A tuple containing the maximum sum, start index, and end index of the best interval.
+    """
+    max_sum = -np.inf
+    current_sum = 0.0
+    start = 0
+    best_start = 0
+    best_end = 0
+
+    for i in range(len(outcomes)):
+        if current_sum <= 0.0:
+            start = i
+            current_sum = outcomes[i]
+        else:
+            current_sum += outcomes[i]
+
+        if current_sum > max_sum:
+            max_sum = current_sum
+            best_start = start
+            best_end = i
+
+    return max_sum, best_start, best_end
+
 
 @pd.api.extensions.register_dataframe_accessor("findrule")
 class RuleFinder:
     def __init__(self, pandas_obj):
         self._obj = pandas_obj
 
-    def __call__(self, target: str, direction: str, variables: List[str], bins: Optional[int] = None) -> Dict:
+    def __call__(self, target: str, direction: str, variables: List[str], bins: Optional[int] = None,
+                 visualize: bool = False) -> Dict:
         """
         Find a rule that shifts the distribution of the target variable in the desired direction.
 
@@ -18,13 +52,28 @@ class RuleFinder:
             direction: Either 'maximize'/'minimize' for numeric targets, or a category name for categorical
             variables: List of feature names to consider for the rule
             bins: Number of bins for histogram visualization (default: 12 or number of unique values if less)
+            visualize: Whether to include visualization in output (default: False)
 
         Returns:
-            Dictionary containing the rule and its impact metrics
+            Dictionary containing:
+                - rule: The discovered rule conditions
+                - metrics: Performance metrics
+                - visualization: Text visualization (if visualize=True)
+                For numeric targets, metrics include:
+                    - score: Improvement score
+                    - matching_median: Median of matching samples
+                    - non_matching_median: Median of non-matching samples
+                    - matching_samples: Number of samples matching the rule
+                    - total_samples: Total number of samples
+                    - coverage: Fraction of samples matching the rule
+                    - additional statistics (mae, rmse, etc.)
+                For categorical targets:
+                    - score: Improvement in target class probability
+                    - matching_rate: Rate of target class in matching samples
+                    - non_matching_rate: Rate of target class in non-matching samples
+                    - precision, recall, f1_score
+                    - coverage statistics
         """
-        # [Previous validation code remains the same]
-
-        # Pass bins parameter through to visualization
         best_rule = {}
         best_score = float('-inf')
         rule_metrics = None
@@ -32,28 +81,31 @@ class RuleFinder:
         # Process each variable
         for var in variables:
             if is_numeric_dtype(self._obj[var]):
-                # For numeric variables, find optimal interval
                 rule_dict = self._find_numeric_rule(var, target, direction)
                 if rule_dict['score'] > best_score:
                     best_score = rule_dict['score']
                     best_rule = {var: rule_dict['interval']}
                     rule_metrics = rule_dict
             else:
-                # For categorical variables, find best category
                 rule_dict = self._find_categorical_rule(var, target, direction)
                 if rule_dict['score'] > best_score:
                     best_score = rule_dict['score']
                     best_rule = {var: rule_dict['value']}
                     rule_metrics = rule_dict
 
-        # Create visualization with bin parameter
-        viz = self._create_rule_visualization(best_rule, target, direction, rule_metrics, bins=bins)
-
-        return {
+        # Prepare return dictionary
+        result = {
             'rule': best_rule,
-            'metrics': rule_metrics,
-            'visualization': viz
+            'metrics': rule_metrics
         }
+
+        # Add visualization only if requested
+        if visualize:
+            result['visualization'] = self._create_rule_visualization(
+                best_rule, target, direction, rule_metrics, bins=bins
+            )
+
+        return result
 
     def _find_numeric_rule(self, feature: str, target: str, direction: str) -> Dict:
         """Find optimal interval for numeric feature using modified Kadane's algorithm."""
@@ -72,24 +124,11 @@ class RuleFinder:
             outcomes = (sorted_df[target] == direction).astype(float)
             outcomes = (outcomes - np.mean(outcomes)) / np.std(outcomes)
 
-        # Run Kadane's algorithm
-        max_sum = float('-inf')
-        current_sum = 0
-        start = 0
-        best_start = 0
-        best_end = 0
+        # Convert outcomes to a Numpy array of type float64 for Numba compatibility
+        outcomes_np = np.array(outcomes, dtype=np.float64)
 
-        for i in range(len(outcomes)):
-            if current_sum <= 0:
-                start = i
-                current_sum = outcomes[i]
-            else:
-                current_sum += outcomes[i]
-
-            if current_sum > max_sum:
-                max_sum = current_sum
-                best_start = start
-                best_end = i
+        # Use the Numba-accelerated function to find the best interval
+        max_sum, best_start, best_end = find_best_interval_kadane(outcomes_np)
 
         # Get interval bounds
         interval = (
@@ -103,6 +142,7 @@ class RuleFinder:
         metrics['interval'] = interval
 
         return metrics
+
 
     def _find_categorical_rule(self, feature: str, target: str, direction: str) -> Dict:
         """Find best category for categorical feature."""
@@ -134,27 +174,69 @@ class RuleFinder:
             # For numeric targets
             matching_median = matching_data.median()
             non_matching_median = non_matching_data.median()
+            matching_mean = matching_data.mean()
+            non_matching_mean = non_matching_data.mean()
 
             if direction == 'maximize':
                 score = (matching_median - non_matching_median) / non_matching_median
             else:  # minimize
                 score = (non_matching_median - matching_median) / non_matching_median
 
-            return {
+            # Additional metrics for continuous outcomes
+            metrics = {
                 'score': score,
                 'matching_median': matching_median,
                 'non_matching_median': non_matching_median,
+                'matching_mean': matching_mean,
+                'non_matching_mean': non_matching_mean,
+                'matching_std': matching_data.std(),
+                'non_matching_std': non_matching_data.std(),
                 'matching_samples': len(matching_data),
                 'total_samples': len(self._obj),
-                'coverage': len(matching_data) / len(self._obj)
+                'coverage': len(matching_data) / len(self._obj),
+
+                # Effect size metrics
+                'cohens_d': (matching_mean - non_matching_mean) /
+                           np.sqrt((matching_data.var() + non_matching_data.var()) / 2),
+
+                # Percentile-based metrics
+                'matching_quartiles': matching_data.quantile([0.25, 0.5, 0.75]).to_dict(),
+                'non_matching_quartiles': non_matching_data.quantile([0.25, 0.5, 0.75]).to_dict(),
+
+                # Distribution metrics
+                'matching_skew': matching_data.skew(),
+                'matching_kurtosis': matching_data.kurtosis(),
+
+                # Range metrics
+                'matching_range': matching_data.max() - matching_data.min(),
+                'matching_iqr': matching_data.quantile(0.75) - matching_data.quantile(0.25)
             }
+
+            # Add robustness metrics
+            bootstrap_scores = []
+            for _ in range(100):  # 100 bootstrap samples
+                sample_idx = np.random.choice(len(self._obj), size=len(self._obj), replace=True)
+                sample_mask = rule_mask.iloc[sample_idx]
+                sample_matching = self._obj.iloc[sample_idx][sample_mask][target]
+                sample_non_matching = self._obj.iloc[sample_idx][~sample_mask][target]
+
+                if len(sample_matching) > 0 and len(sample_non_matching) > 0:
+                    sample_score = ((sample_matching.median() - sample_non_matching.median()) /
+                                  sample_non_matching.median())
+                    bootstrap_scores.append(sample_score)
+
+            metrics['score_std'] = np.std(bootstrap_scores) if bootstrap_scores else np.nan
+            metrics['score_95ci'] = (np.percentile(bootstrap_scores, [2.5, 97.5])
+                                   if bootstrap_scores else (np.nan, np.nan))
+
+            return metrics
+
         else:
-            # For categorical targets
+            # Original categorical metrics code remains the same
             matching_rate = (matching_data == direction).mean()
             non_matching_rate = (non_matching_data == direction).mean()
             improvement = matching_rate - non_matching_rate
 
-            # Calculate precision, recall, and F1 score
             true_positives = (matching_data == direction).sum()
             false_positives = (matching_data != direction).sum()
             false_negatives = (non_matching_data == direction).sum()
