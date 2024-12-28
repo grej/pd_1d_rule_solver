@@ -1,0 +1,10 @@
+# Exclude .ropeproject directory
+.ropeproject/
+
+# Exclude specific files
+codebase.md
+flatten_files.yml
+mdproj.md
+pyrightconfig.json
+.ipynb_checkpoints/
+mdproj.py
