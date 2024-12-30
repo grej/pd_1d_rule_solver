@@ -36,62 +36,44 @@ def find_best_interval_kadane(outcomes: np.ndarray) -> Tuple[float, int, int]:
 
     return max_sum, best_start, best_end
 
-
 @pd.api.extensions.register_dataframe_accessor("findrule")
 class RuleFinder:
     def __init__(self, pandas_obj):
         self._obj = pandas_obj
 
-    def __call__(self, target: str, direction: str, variables: List[str], bins: Optional[int] = None,
-                 visualize: bool = False) -> Dict:
+    def __call__(self, target: str, direction: str, variables: Optional[List[str]] = None,
+                 bins: Optional[int] = None, visualize: bool = False) -> Dict:
         """
         Find a rule that shifts the distribution of the target variable in the desired direction.
 
         Args:
             target: Target variable name
-            direction: Either 'maximize'/'minimize' for numeric targets, or a category name for categorical
-            variables: List of feature names to consider for the rule
+            direction: Either 'maximize'/'minimize' for numeric targets, or category name for categorical
+            variables: List of feature names to consider for the rule. If None, uses all numeric columns.
             bins: Number of bins for histogram visualization (default: 12 or number of unique values if less)
             visualize: Whether to include visualization in output (default: False)
 
         Returns:
-            Dictionary containing:
-                - rule: The discovered rule conditions
-                - metrics: Performance metrics
-                - visualization: Text visualization (if visualize=True)
-                For numeric targets, metrics include:
-                    - score: Improvement score
-                    - matching_median: Median of matching samples
-                    - non_matching_median: Median of non-matching samples
-                    - matching_samples: Number of samples matching the rule
-                    - total_samples: Total number of samples
-                    - coverage: Fraction of samples matching the rule
-                    - additional statistics (mae, rmse, etc.)
-                For categorical targets:
-                    - score: Improvement in target class probability
-                    - matching_rate: Rate of target class in matching samples
-                    - non_matching_rate: Rate of target class in non-matching samples
-                    - precision, recall, f1_score
-                    - coverage statistics
+            Dictionary containing the rule and its metrics
         """
+        if variables is None:
+            variables = [col for col in self._obj.columns
+                        if col != target and np.issubdtype(self._obj[col].dtype, np.number)]
+
         best_rule = {}
         best_score = float('-inf')
         rule_metrics = None
 
         # Process each variable
         for var in variables:
-            if is_numeric_dtype(self._obj[var]):
-                rule_dict = self._find_numeric_rule(var, target, direction)
-                if rule_dict['score'] > best_score:
-                    best_score = rule_dict['score']
-                    best_rule = {var: rule_dict['interval']}
-                    rule_metrics = rule_dict
-            else:
-                rule_dict = self._find_categorical_rule(var, target, direction)
-                if rule_dict['score'] > best_score:
-                    best_score = rule_dict['score']
-                    best_rule = {var: rule_dict['value']}
-                    rule_metrics = rule_dict
+            if not np.issubdtype(self._obj[var].dtype, np.number):
+                continue
+
+            rule_dict = self._find_numeric_rule(var, target, direction)
+            if rule_dict['score'] > best_score:
+                best_score = rule_dict['score']
+                best_rule = {var: rule_dict['interval']}
+                rule_metrics = rule_dict
 
         # Prepare return dictionary
         result = {
@@ -99,7 +81,6 @@ class RuleFinder:
             'metrics': rule_metrics
         }
 
-        # Add visualization only if requested
         if visualize:
             result['visualization'] = self._create_rule_visualization(
                 best_rule, target, direction, rule_metrics, bins=bins
@@ -109,32 +90,36 @@ class RuleFinder:
 
     def _find_numeric_rule(self, feature: str, target: str, direction: str) -> Dict:
         """Find optimal interval for numeric feature using modified Kadane's algorithm."""
-        # Sort data by feature
+        # Sort data by feature and create aggregated array for Kadane's
         sorted_df = self._obj.sort_values(feature).reset_index(drop=True)
 
-        # Prepare target values
+        # Create target values array with proper standardization
         if is_numeric_dtype(self._obj[target]):
-            # For numeric targets, standardize values
             values = sorted_df[target].values
+            # Standardize numeric targets
             outcomes = (values - np.mean(values)) / np.std(values)
             if direction == 'minimize':
                 outcomes = -outcomes
         else:
-            # For categorical targets, create binary outcomes
+            # For categorical targets, create binary outcomes and standardize
             outcomes = (sorted_df[target] == direction).astype(float)
             outcomes = (outcomes - np.mean(outcomes)) / np.std(outcomes)
 
-        # Convert outcomes to a Numpy array of type float64 for Numba compatibility
-        outcomes_np = np.array(outcomes, dtype=np.float64)
+        # Group by unique feature values and aggregate scores
+        grouped = pd.DataFrame({
+            'feature_val': sorted_df[feature],
+            'outcome': outcomes
+        }).groupby('feature_val', observed=True)['outcome'].sum().reset_index()
 
-        # Use the Numba-accelerated function to find the best interval
-        max_sum, best_start, best_end = find_best_interval_kadane(outcomes_np)
+        # Convert to numpy arrays for Kadane's
+        feature_values = grouped['feature_val'].values
+        agg_scores = grouped['outcome'].values.astype(np.float64)  # Ensure float64 for numba
 
-        # Get interval bounds
-        interval = (
-            sorted_df[feature].iloc[best_start],
-            sorted_df[feature].iloc[best_end]
-        )
+        # Find optimal interval using Kadane's
+        max_sum, best_start, best_end = find_best_interval_kadane(agg_scores)
+
+        # Get interval bounds from feature values
+        interval = (feature_values[best_start], feature_values[best_end])
 
         # Calculate metrics
         rule_mask = (self._obj[feature] >= interval[0]) & (self._obj[feature] <= interval[1])
@@ -142,7 +127,6 @@ class RuleFinder:
         metrics['interval'] = interval
 
         return metrics
-
 
     def _find_categorical_rule(self, feature: str, target: str, direction: str) -> Dict:
         """Find best category for categorical feature."""

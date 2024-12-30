@@ -24,26 +24,13 @@ class RuleExtender:
         self.df = df
 
     def extend_rule(self,
-                   current_rule: Dict,
-                   target: str,
-                   direction: str,
-                   candidate_vars: Optional[List[str]] = None,
-                   min_improvement: float = 0.05,
-                   max_conditions: int = 3) -> Tuple[Dict, Dict]:
-        """
-        Extend an existing rule by adding conditions that improve its performance.
-
-        Args:
-            current_rule: Current rule conditions
-            target: Target variable name
-            direction: Either 'maximize'/'minimize' for numeric targets, or category name
-            candidate_vars: List of variables to consider (if None, uses all numeric columns)
-            min_improvement: Minimum score improvement required to add condition
-            max_conditions: Maximum number of conditions in the final rule
-
-        Returns:
-            Tuple of (extended rule dict, metrics dict)
-        """
+                current_rule: Dict,
+                target: str,
+                direction: str,
+                candidate_vars: Optional[List[str]] = None,
+                min_improvement: float = 0.05,
+                max_conditions: int = 3) -> Tuple[Dict, Dict]:
+        """Extend an existing rule by adding conditions that improve its performance."""
         if len(current_rule) >= max_conditions:
             return current_rule, self._evaluate_rule(current_rule, target, direction)
 
@@ -52,6 +39,13 @@ class RuleExtender:
         best_score = original_metrics['score']
         best_rule = current_rule.copy()
         best_metrics = original_metrics
+
+        # If no candidate vars provided, use all numeric columns except those already in rule
+        if candidate_vars is None:
+            candidate_vars = [col for col in self.df.columns
+                            if col != target
+                            and col not in current_rule
+                            and np.issubdtype(self.df[col].dtype, np.number)]
 
         # Get variable suggestions
         suggestions = suggest_next_variable(
@@ -64,6 +58,10 @@ class RuleExtender:
 
         # Try each suggested variable
         for suggestion in suggestions:
+            # Skip if variable is already in rule
+            if suggestion.name in current_rule:
+                continue
+
             # Find optimal condition for this variable
             extended_rule, metrics = self._find_optimal_extension(
                 current_rule,
@@ -72,8 +70,9 @@ class RuleExtender:
                 direction
             )
 
-            # Check if improvement is sufficient
-            if metrics['score'] > best_score * (1 + min_improvement):
+            # Check if improvement is sufficient and rule actually changed
+            if (metrics['score'] > best_score * (1 + min_improvement) and
+                len(extended_rule) > len(current_rule)):
                 best_score = metrics['score']
                 best_rule = extended_rule
                 best_metrics = metrics

@@ -3,6 +3,7 @@
 
 # Exclude specific files
 codebase.md
+*__pycache__*
 flatten_files.yml
 mdproj.md
 pyrightconfig.json

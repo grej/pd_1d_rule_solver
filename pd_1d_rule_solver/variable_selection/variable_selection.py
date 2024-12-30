@@ -238,16 +238,11 @@ class VariableSelector:
         self.sampler = AdaptiveSampler(df, sample_threshold)
 
     def score_variables(self,
-                       target: str,
-                       candidate_vars: List[str],
-                       current_rule: Optional[Dict] = None) -> List[VariableScore]:
+                    target: str,
+                    candidate_vars: List[str],
+                    current_rule: Optional[Dict] = None) -> List[VariableScore]:
         """
         Score variables based on their potential for improving the current rule.
-
-        Args:
-            target: Target variable name
-            candidate_vars: List of variables to evaluate
-            current_rule: Current rule conditions (optional)
         """
         # Get rule mask if rule exists
         if current_rule:
@@ -259,18 +254,29 @@ class VariableSelector:
         sample_df, sample_mask = self.sampler.get_sample(target, rule_mask)
 
         # Convert target to numeric if categorical
-        target_vals = sample_df[target].values
-        if not np.issubdtype(target_vals.dtype, np.number):
-            target_vals = pd.Categorical(target_vals).codes
+        if isinstance(sample_df[target].dtype, pd.CategoricalDtype):
+            target_vals = sample_df[target].cat.codes.values  # Convert to numpy array
+        elif not np.issubdtype(sample_df[target].dtype, np.number):
+            target_vals = pd.Categorical(sample_df[target]).codes
+        else:
+            target_vals = sample_df[target].values
+
+        target_vals = target_vals.astype(np.float64)  # Ensure float64 type for numba
 
         scores = []
         for var in candidate_vars:
             if var in (current_rule or {}):
                 continue
 
-            var_vals = sample_df[var].values
-            if not np.issubdtype(var_vals.dtype, np.number):
-                var_vals = pd.Categorical(var_vals).codes
+            # Convert variable to numeric
+            if isinstance(sample_df[var].dtype, pd.CategoricalDtype):
+                var_vals = sample_df[var].cat.codes.values
+            elif not np.issubdtype(sample_df[var].dtype, np.number):
+                var_vals = pd.Categorical(sample_df[var]).codes
+            else:
+                var_vals = sample_df[var].values
+
+            var_vals = var_vals.astype(np.float64)  # Ensure float64 type for numba
 
             # Compute information metrics
             mi_score = self._compute_mi(var_vals, target_vals)
@@ -325,24 +331,48 @@ class VariableSelector:
             return 0.0
 
         x_range = x.max() - x.min()
-        boundary_dist = x_range * self.boundary_width
+        if x_range == 0:  # Handle constant values
+            return 0.0
 
+        boundary_dist = x_range * self.boundary_width
         match_median = np.median(x[rule_mask])
         boundary_mask = np.abs(x - match_median) <= boundary_dist
 
         if not boundary_mask.any():
             return 0.0
 
-        boundary_corr = np.corrcoef(x[boundary_mask], y[boundary_mask])[0, 1]
-        return abs(boundary_corr)
+        # Handle potential constant values
+        x_boundary = x[boundary_mask]
+        y_boundary = y[boundary_mask]
+
+        if len(x_boundary) < 2 or len(np.unique(x_boundary)) < 2 or len(np.unique(y_boundary)) < 2:
+            return 0.0
+
+        try:
+            boundary_corr = np.corrcoef(x_boundary, y_boundary)[0, 1]
+            if np.isnan(boundary_corr):
+                return 0.0
+            return abs(boundary_corr)
+        except:
+            return 0.0
+
 
     def _estimate_improvement_potential(self, x: np.ndarray, y: np.ndarray, rule_mask: np.ndarray) -> float:
         """Estimate potential for improvement by combining multiple metrics."""
-        mi_contrib = self._compute_mi(x, y)
-        cmi_contrib = self._compute_conditional_mi(x, y, rule_mask)
-        bound_contrib = self._compute_boundary_sensitivity(x, y, rule_mask)
+        try:
+            mi_contrib = self._compute_mi(x, y)
+            cmi_contrib = self._compute_conditional_mi(x, y, rule_mask)
+            bound_contrib = self._compute_boundary_sensitivity(x, y, rule_mask)
 
-        return 0.4 * mi_contrib + 0.4 * cmi_contrib + 0.2 * bound_contrib
+            # Handle potential nan values
+            mi_contrib = 0.0 if np.isnan(mi_contrib) else mi_contrib
+            cmi_contrib = 0.0 if np.isnan(cmi_contrib) else cmi_contrib
+            bound_contrib = 0.0 if np.isnan(bound_contrib) else bound_contrib
+
+            return 0.4 * mi_contrib + 0.4 * cmi_contrib + 0.2 * bound_contrib
+        except:
+            return 0.0
+
 
     def _evaluate_rule(self, rule: Dict) -> np.ndarray:
         """Evaluate rule conditions on the dataset."""
