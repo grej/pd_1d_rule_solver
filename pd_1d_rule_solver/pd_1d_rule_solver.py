@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from pandas.api.types import is_numeric_dtype
+import pandas.api.types
 from typing import List, Union, Dict, Tuple, Optional
 import warnings
 from numba import njit  # Import Numba's JIT decorator
@@ -42,48 +42,195 @@ class RuleFinder:
         self._obj = pandas_obj
 
     def __call__(self, target: str, direction: str, variables: Optional[List[str]] = None,
-                 bins: Optional[int] = None, visualize: bool = False) -> Dict:
+                 bins: Optional[int] = None, visualize: bool = False, depth: int = 1,
+                 min_improvement: float = 0.05, reopt_iterations: int = 2) -> Dict:
         """
         Find a rule that shifts the distribution of the target variable in the desired direction.
 
         Args:
             target: Target variable name
             direction: Either 'maximize'/'minimize' for numeric targets, or category name for categorical
-            variables: List of feature names to consider for the rule. If None, uses all numeric columns.
+            variables: List of feature names to consider for the rule. If None, uses all numeric columns
             bins: Number of bins for histogram visualization (default: 12 or number of unique values if less)
             visualize: Whether to include visualization in output (default: False)
+            depth: Maximum number of conditions to include in rule (default: 1)
+            min_improvement: Minimum relative improvement required to add a condition (default: 0.05)
+            reopt_iterations: Number of re-optimization passes through all variables (default: 2)
 
         Returns:
-            Dictionary containing the rule and its metrics
+            Dictionary containing:
+                - rule: The best overall rule found
+                - metrics: Metrics for the best rule
+                - evolution: List of (rule, metrics) showing how rule was built
+                - onedim_rules: Dict mapping each variable to its best 1D rule
         """
+
+        # BEGIN Input validation
+        if len(self._obj) == 0:
+            raise ValueError("Cannot find rules on empty DataFrame")
+
+        if target not in self._obj.columns:
+            raise ValueError(f"Target column '{target}' not found in DataFrame")
+
         if variables is None:
             variables = [col for col in self._obj.columns
-                        if col != target and np.issubdtype(self._obj[col].dtype, np.number)]
+                        if col != target and pandas.api.types.is_numeric_dtype(self._obj[col])]
 
+        if not variables:
+            raise ValueError("No numeric variables available for rule finding")
+
+        if not all(var in self._obj.columns for var in variables):
+            missing = [var for var in variables if var not in self._obj.columns]
+            raise ValueError(f"Variables not found in DataFrame: {missing}")
+
+        # Check if we have any data in target column after removing NAs
+        if self._obj[target].dropna().empty:
+            raise ValueError("No valid data in target column after removing NAs")
+
+        # For categorical targets, check if direction is valid
+        if isinstance(self._obj[target].dtype, pd.CategoricalDtype) or pd.api.types.is_object_dtype(self._obj[target]):
+            unique_values = self._obj[target].unique()
+            if direction not in unique_values:
+                raise ValueError(f"Direction '{direction}' not found in target categories: {unique_values}")
+        # END INPUT VALIDATION
+
+        # First pass: find all 1D rules and the best single variable
+        onedim_rules = {}
         best_rule = {}
         best_score = float('-inf')
         rule_metrics = None
 
-        # Process each variable
         for var in variables:
             if not np.issubdtype(self._obj[var].dtype, np.number):
                 continue
 
             rule_dict = self._find_numeric_rule(var, target, direction)
+            onedim_rules[var] = {'rule': {var: rule_dict['interval']}, 'metrics': rule_dict}
+
             if rule_dict['score'] > best_score:
                 best_score = rule_dict['score']
                 best_rule = {var: rule_dict['interval']}
                 rule_metrics = rule_dict
 
+        # If we didn't find any valid rules, create a default metrics dict
+        if rule_metrics is None:
+            rule_metrics = {
+                'score': float('-inf'),
+                'matching_samples': 0,
+                'total_samples': len(self._obj),
+                'coverage': 0.0
+            }
+
+        # Initialize evolution tracking
+        evolution = [(best_rule, rule_metrics)]
+        current_rule = best_rule
+        current_metrics = rule_metrics
+        used_vars = list(current_rule.keys())
+
+        # Add more conditions if depth > 1
+        if depth > 1:
+            for _ in range(depth - 1):
+                # Get remaining variables
+                remaining_vars = [col for col in variables if col not in used_vars]
+
+                if not remaining_vars:
+                    break
+
+                # Create mask for current rule
+                def matches_current_rule(row):
+                    for feature, interval in current_rule.items():
+                        if not (interval[0] <= row[feature] <= interval[1]):
+                            return False
+                    return True
+
+                current_mask = self._obj.apply(matches_current_rule, axis=1)
+                matching_df = self._obj[current_mask]
+
+                # Try each remaining variable
+                best_new_rule = None
+                best_new_metrics = None
+
+                for var in remaining_vars:
+                    if not np.issubdtype(self._obj[var].dtype, np.number):
+                        continue
+
+                    result = matching_df.findrule(target=target, direction=direction, variables=[var])
+
+                    if result['metrics']['score'] > current_metrics['score'] * (1 + min_improvement):
+                        new_rule = current_rule.copy()
+                        new_rule.update(result['rule'])
+
+                        # Evaluate complete rule
+                        test_mask = self._obj.apply(
+                            lambda row: all(interval[0] <= row[var] <= interval[1]
+                                          for var, interval in new_rule.items()),
+                            axis=1
+                        )
+                        test_metrics = self._calculate_metrics(test_mask, target, direction)
+
+                        if (best_new_metrics is None or
+                            test_metrics['score'] > best_new_metrics['score']):
+                            best_new_rule = new_rule
+                            best_new_metrics = test_metrics
+
+                # If we found an improvement, update current rule
+                if best_new_rule is not None:
+                    current_rule = best_new_rule
+                    current_metrics = best_new_metrics
+                    used_vars = list(current_rule.keys())
+                    evolution.append((current_rule, current_metrics))
+
+                    # Re-optimize intervals
+                    for _ in range(reopt_iterations):
+                        for var_to_reopt in used_vars:
+                            # Create temporary rule without the variable we're re-optimizing
+                            temp_rule = {k: v for k, v in current_rule.items()
+                                       if k != var_to_reopt}
+
+                            # Get data matching all other conditions
+                            temp_mask = self._obj.apply(
+                                lambda row: all(interval[0] <= row[var] <= interval[1]
+                                              for var, interval in temp_rule.items()),
+                                axis=1
+                            )
+                            temp_matching_df = self._obj[temp_mask]
+
+                            # Find optimal interval for this variable
+                            result = temp_matching_df.findrule(
+                                target=target,
+                                direction=direction,
+                                variables=[var_to_reopt]
+                            )
+
+                            # Update interval if it improves overall rule
+                            test_rule = temp_rule.copy()
+                            test_rule.update(result['rule'])
+
+                            test_mask = self._obj.apply(
+                                lambda row: all(interval[0] <= row[var] <= interval[1]
+                                              for var, interval in test_rule.items()),
+                                axis=1
+                            )
+                            test_metrics = self._calculate_metrics(test_mask, target, direction)
+
+                            if test_metrics['score'] > current_metrics['score'] * (1 + min_improvement):
+                                current_rule = test_rule
+                                current_metrics = test_metrics
+                                evolution.append((current_rule, current_metrics))
+                else:
+                    break
+
         # Prepare return dictionary
         result = {
-            'rule': best_rule,
-            'metrics': rule_metrics
+            'rule': current_rule,
+            'metrics': current_metrics,
+            'evolution': evolution,
+            'onedim_rules': onedim_rules
         }
 
         if visualize:
             result['visualization'] = self._create_rule_visualization(
-                best_rule, target, direction, rule_metrics, bins=bins
+                current_rule, target, direction, current_metrics, bins=bins
             )
 
         return result
@@ -94,16 +241,24 @@ class RuleFinder:
         sorted_df = self._obj.sort_values(feature).reset_index(drop=True)
 
         # Create target values array with proper standardization
-        if is_numeric_dtype(self._obj[target]):
+        if pandas.api.types.is_numeric_dtype(self._obj[target]):
             values = sorted_df[target].values
             # Standardize numeric targets
-            outcomes = (values - np.mean(values)) / np.std(values)
+            std_dev = np.std(values)
+            if std_dev == 0:  # Handle single value case
+                outcomes = np.zeros_like(values, dtype=float)
+            else:
+                outcomes = (values - np.mean(values)) / std_dev
             if direction == 'minimize':
                 outcomes = -outcomes
         else:
             # For categorical targets, create binary outcomes and standardize
             outcomes = (sorted_df[target] == direction).astype(float)
-            outcomes = (outcomes - np.mean(outcomes)) / np.std(outcomes)
+            std_dev = np.std(outcomes)
+            if std_dev == 0:  # Handle single value case
+                outcomes = np.zeros_like(outcomes, dtype=float)
+            else:
+                outcomes = (outcomes - np.mean(outcomes)) / std_dev
 
         # Group by unique feature values and aggregate scores
         grouped = pd.DataFrame({
@@ -127,6 +282,7 @@ class RuleFinder:
         metrics['interval'] = interval
 
         return metrics
+
 
     def _find_categorical_rule(self, feature: str, target: str, direction: str) -> Dict:
         """Find best category for categorical feature."""
@@ -152,14 +308,34 @@ class RuleFinder:
         non_matching_data = self._obj[~rule_mask][target]
 
         if len(matching_data) == 0 or len(non_matching_data) == 0:
-            return {'score': float('-inf')}
+            return {
+                'score': float('-inf'),
+                'matching_samples': len(matching_data),
+                'total_samples': len(self._obj),
+                'coverage': len(matching_data) / len(self._obj)
+            }
 
-        if is_numeric_dtype(self._obj[target]):
+        if pd.api.types.is_numeric_dtype(self._obj[target]):
             # For numeric targets
             matching_median = matching_data.median()
             non_matching_median = non_matching_data.median()
             matching_mean = matching_data.mean()
             non_matching_mean = non_matching_data.mean()
+
+            # Handle single value case - if both medians are equal, no meaningful split found
+            if matching_median == non_matching_median:
+                return {
+                    'score': float('-inf'),
+                    'matching_median': matching_median,
+                    'non_matching_median': non_matching_median,
+                    'matching_mean': matching_median,
+                    'non_matching_mean': non_matching_median,
+                    'matching_std': 0,
+                    'non_matching_std': 0,
+                    'matching_samples': len(matching_data),
+                    'total_samples': len(self._obj),
+                    'coverage': len(matching_data) / len(self._obj)
+                }
 
             if direction == 'maximize':
                 score = (matching_median - non_matching_median) / non_matching_median
@@ -181,7 +357,7 @@ class RuleFinder:
 
                 # Effect size metrics
                 'cohens_d': (matching_mean - non_matching_mean) /
-                           np.sqrt((matching_data.var() + non_matching_data.var()) / 2),
+                        np.sqrt((matching_data.var() + non_matching_data.var()) / 2),
 
                 # Percentile-based metrics
                 'matching_quartiles': matching_data.quantile([0.25, 0.5, 0.75]).to_dict(),
@@ -206,12 +382,12 @@ class RuleFinder:
 
                 if len(sample_matching) > 0 and len(sample_non_matching) > 0:
                     sample_score = ((sample_matching.median() - sample_non_matching.median()) /
-                                  sample_non_matching.median())
+                                sample_non_matching.median())
                     bootstrap_scores.append(sample_score)
 
             metrics['score_std'] = np.std(bootstrap_scores) if bootstrap_scores else np.nan
             metrics['score_95ci'] = (np.percentile(bootstrap_scores, [2.5, 97.5])
-                                   if bootstrap_scores else (np.nan, np.nan))
+                                if bootstrap_scores else (np.nan, np.nan))
 
             return metrics
 
@@ -288,7 +464,7 @@ class RuleFinder:
                     f"({total_matching/len(self._obj):.1%} of data)")
 
         # Show target distribution
-        if is_numeric_dtype(self._obj[target]):
+        if pandas.api.types.is_numeric_dtype(self._obj[target]):
             matching_median = matching_df[target].median()
             non_matching_median = non_matching_df[target].median()
             all_median = self._obj[target].median()
