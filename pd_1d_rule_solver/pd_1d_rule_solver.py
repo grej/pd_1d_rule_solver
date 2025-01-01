@@ -40,6 +40,9 @@ def find_best_interval_kadane(outcomes: np.ndarray) -> Tuple[float, int, int]:
 class RuleFinder:
     def __init__(self, pandas_obj):
         self._obj = pandas_obj
+        # Add a dictionary to cache sorted DataFrames for each numeric feature
+        self._sorted_dfs = {}
+
 
     def __call__(self, target: str, direction: str, variables: Optional[List[str]] = None,
                  bins: Optional[int] = None, visualize: bool = False, depth: int = 1,
@@ -237,8 +240,13 @@ class RuleFinder:
 
     def _find_numeric_rule(self, feature: str, target: str, direction: str) -> Dict:
         """Find optimal interval for numeric feature using modified Kadane's algorithm."""
-        # Sort data by feature and create aggregated array for Kadane's
-        sorted_df = self._obj.sort_values(feature).reset_index(drop=True)
+        # Instead of sorting every time, check our cache:
+        if feature not in self._sorted_dfs:
+            # Cache a sorted DataFrame containing only this feature and the target
+            self._sorted_dfs[feature] = self._obj[[feature, target]].sort_values(feature).reset_index(drop=True)
+
+        # Retrieve the cached DataFrame
+        sorted_df = self._sorted_dfs[feature]
 
         # Create target values array with proper standardization
         if pandas.api.types.is_numeric_dtype(self._obj[target]):
@@ -282,7 +290,6 @@ class RuleFinder:
         metrics['interval'] = interval
 
         return metrics
-
 
     def _find_categorical_rule(self, feature: str, target: str, direction: str) -> Dict:
         """Find best category for categorical feature."""
